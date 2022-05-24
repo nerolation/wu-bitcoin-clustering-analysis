@@ -1,0 +1,1864 @@
+# Partition table into monthly chunks
+
+CREATE OR REPLACE TABLE    `btc.bitcoin`   (ts TIMESTAMP, 
+                                            tx_id STRING, 
+                                            input_tx_id STRING, 
+                                            vout INT64, 
+                                            output_to STRING, 
+                                            output_index INT64,
+                                            value INT64,
+                                            blk_file_nr INT64
+                                            )
+
+PARTITION BY                 DATE_TRUNC(ts, YEAR)      AS 
+
+SELECT TIMESTAMP_SECONDS(ts) ts, 
+                             tx_id, 
+                             input_tx_id, 
+                             vout, 
+                             output_to, 
+                             output_index,
+                             value,
+                             blk_file_nr
+
+FROM                        `btc.bitcoin_transactions`;
+
+# Address => ID mapping
+CREATE OR REPLACE TABLE      `btc.ids_addresses` AS
+
+SELECT    ROW_NUMBER() OVER() id,
+          address
+
+FROM      (SELECT DISTINCT    output_to  AS address 
+          FROM               `btc.bitcoin`)
+
+ORDER BY  id;
+
+# Transaction Hash => ID mapping
+CREATE OR REPLACE TABLE `btc.ids_transactions` AS
+
+SELECT    ROW_NUMBER() OVER() id,
+          tx_id
+
+FROM      (SELECT DISTINCT    tx_id 
+          FROM               `btc.bitcoin`)
+
+ORDER BY  id;
+
+# Hashes and Addresses to INT64 for efficiency reasons
+
+CREATE OR REPLACE TABLE `btc.bitcoin_int`  (ts TIMESTAMP, 
+                                            tx_id INT64,
+                                            input_tx_id INT64,
+                                            vout INT64,
+                                            output_to_id INT64, 
+                                            output_index INT64,
+                                            value INT64,
+                                            script_type INT64,
+                                            blk_file_nr INT64
+                                            )
+
+PARTITION BY    DATE_TRUNC(ts, MONTH)    AS 
+
+WITH u_ids AS (
+    SELECT  address, id FROM `btc.ids_addresses`
+),
+t_ids AS (
+    SELECT  tx_id, id  FROM `btc.ids_transactions`
+),
+s_ids AS (
+    SELECT  script_type, id  FROM `btc.ids_scripts`
+)
+
+SELECT          TIMESTAMP_SECONDS(DS.ts) ts,
+                Hash_ID.id   AS tx_id, 
+                IFNULL(Hash_ID_IN.id, 0) AS input_tx_id,
+                DS.vout,
+                Addr_ID_O.id AS output_to_id,
+                DS.output_index,
+                DS.value,
+                SCRIPT.id,
+                DS.blk_file_nr
+                
+FROM
+               (SELECT      ts, 
+                            tx_id, 
+                            input_tx_id,
+                            vout, 
+                            output_to,
+                            output_index,
+                            value,
+                            script_type,
+                            blk_file_nr
+                FROM       `btc.bitcoin`)   DS
+
+                LEFT JOIN 
+               (SELECT  address, id FROM u_ids)    Addr_ID_O 
+                ON      DS.output_to  = Addr_ID_O.address
+
+                LEFT JOIN 
+               (SELECT  tx_id, id  FROM t_ids)     Hash_ID   
+                ON      DS.tx_id     = Hash_ID.tx_id
+
+                LEFT JOIN 
+               (SELECT  tx_id, id  FROM t_ids)     Hash_ID_IN   
+                ON      DS.input_tx_id     = Hash_ID_IN.tx_id
+
+                 LEFT JOIN 
+               (SELECT  script_type, id  FROM s_ids)     SCRIPT   
+                ON      DS.script_type     = SCRIPT.script_type;
+                
+#
+# Utxo/Input Mapping
+#
+# Mapping Algoritm tho link Utxos to Inputs
+# Coinbase transactions excluded
+# Partition table into monthly chunks and exclude coinbase edges, 
+# OP_RETURNs and edges with unknown scripts
+
+CREATE OR REPLACE TABLE  `btc.bitcoin_mapped`      (ts TIMESTAMP, 
+                                                    txhash STRING, 
+                                                    input_from STRING, 
+                                                    output_to STRING,
+                                                    value INT64
+                                                   )
+
+PARTITION BY             DATE_TRUNC(ts, MONTH)   AS     
+
+SELECT                   Tx.ts,
+                         Tx.txhash,
+                         Utxo.output_to AS input_from,
+                         Tx.output_to,
+                         Tx.value
+
+FROM (SELECT             ts, 
+                         txhash, 
+                         input_txhash,
+                         vout,
+                         output_to,
+                         value
+
+      FROM              `btc.bitcoin`) Tx
+   
+      LEFT JOIN   
+
+     (SELECT DISTINCT    txhash, 
+                         output_index, 
+                         output_to 
+
+      FROM              `btc.bitcoin`) Utxo
+
+      ON                (Tx.input_txhash = Utxo.txhash 
+                         AND     
+                         Tx.vout = Utxo.output_index)
+
+WHERE                        input_from != "0"
+AND                          output_to  != "undefined" 
+AND                          output_to  != "invalid" 
+AND                          output_to  != "op_return"
+AND                          output_to  != "unknown";
+
+#
+# Utxo/Input Mapping
+#
+# Mapping Algoritm tho link Utxos to Inputs
+# Coinbase transactions excluded
+# Partition table into monthly chunks and exclude coinbase edges, 
+# OP_RETURNs and edges with unknown scripts
+
+CREATE OR REPLACE TABLE  `btc.bitcoin_mapped_int`  (ts TIMESTAMP, 
+                                                    tx_id INT64, 
+                                                    input_from_id INT64, 
+                                                    input_index INT64,
+                                                    output_to_id INT64,
+                                                    output_index INT64,
+                                                    value INT64,
+                                                    output_script_type INT64,
+                                                    blk_file_nr INT64
+                                                   )
+
+PARTITION BY             DATE_TRUNC(ts, MONTH)   AS     
+
+SELECT                   Tx.ts,
+                         Tx.tx_id,
+                         Utxo.output_to_id AS input_from_id,
+                         Tx.vout AS input_index,
+                         Tx.output_to_id,
+                         Tx.output_index,
+                         Tx.value,
+                         Tx.script_type AS output_script_type,
+                         Tx.blk_file_nr
+
+FROM (SELECT             ts, 
+                         tx_id, 
+                         input_tx_id,
+                         vout,
+                         output_to_id,
+                         output_index,
+                         value,
+                         script_type,
+                         blk_file_nr
+
+      FROM              `btc.bitcoin_int`
+      WHERE              output_to_id NOT IN (
+                            SELECT DISTINCT id FROM `btc.ids_addresses`
+                            WHERE address  = "undefined" 
+                            OR    address  = "invalid" 
+                            OR    address  = "op_return"
+                            OR    address  = "unknown"
+                            )) Tx
+            
+      LEFT JOIN   
+
+     (SELECT DISTINCT    tx_id, 
+                         output_index, 
+                         output_to_id 
+
+      FROM              `btc.bitcoin_int`) Utxo
+
+      ON                (Tx.input_tx_id = Utxo.tx_id 
+                         AND     
+                         Tx.vout = Utxo.output_index)
+
+WHERE input_tx_id  != 0;
+
+# Wasabi CoinJoin Heuristik by para77
+#
+# Known addresses heuristik
+# https://github.com/nopara73/Dumplings/blob/master/Dumplings/Scanning/Scanner.cs
+
+CREATE OR REPLACE TABLE `btc.coinj_wasabi_1_int` AS
+
+WITH coord AS (
+    SELECT B.ts, A.tx_id, B.value, B.output_to_id FROM (
+        (SELECT DISTINCT tx_id FROM `btc.bitcoin_mapped_int` 
+         WHERE output_to_id IN     (SELECT  id
+                                    FROM    `btc.ids_addresses` 
+                                    WHERE   address = "bc1qa24tsgchvuxsaccp8vrnkfd85hrcpafg20kmjw" 
+                                    OR      address = "bc1qs604c7jv6amk4cxqlnvuxv26hv3e48cds4m0ew")) A
+    
+        INNER JOIN
+       (SELECT          ts,
+                        tx_id, 
+                        output_to_id,
+                        value,
+        FROM           `btc.bitcoin_mapped_int`
+        WHERE           ts >= TIMESTAMP("2018-07-05 00:03:00+00")) B 
+        ON A.tx_id = B.tx_id)
+)
+
+SELECT DISTINCT ts, tx_id FROM(         
+    SELECT          ts,
+                    tx_id, 
+                    value,
+                    COUNT(DISTINCT CONCAT(output_to_id, value)) c 
+    FROM            coord 
+    WHERE           ts >= TIMESTAMP("2018-07-05 00:03:00+00")
+    
+    GROUP BY        ts, tx_id, value
+    HAVING          c >= 3);
+  
+  
+# Wasabi CoinJoin Heuristik 2
+#
+# https://github.com/nopara73/Dumplings/blob/master/Dumplings/Scanning/Scanner.cs
+
+CREATE OR REPLACE TABLE `btc.coinj_wasabi_2_int` AS
+
+WITH nonsegwits AS (
+    SELECT address, id FROM `btc.ids_addresses`
+    WHERE address NOT LIKE "bc1q%"
+),
+
+firststep AS (
+    SELECT DISTINCT ts, tx_id, frequentEqualOutputCount FROM (
+                        SELECT DISTINCT ts,
+                                        tx_id, 
+                                        value, 
+                                        COUNT(DISTINCT CONCAT(output_to_id, value)) frequentEqualOutputCount
+                                
+                        FROM       `btc.bitcoin_mapped_int`
+                        
+                        WHERE       ts >= TIMESTAMP("2019-12-27 11:53:00+00")
+                        
+                        # Most frequent output equals 0.1 +- 0.02 BTC
+                        AND         value BETWEEN 8000000 AND 12000000
+                        
+                        GROUP BY    ts, tx_id, value
+
+                        # Most frequent equal output count is greater 9
+                        HAVING      frequentEqualOutputCount >= 10)
+),
+secondstep AS (
+    SELECT DISTINCT First_Batch.ts, First_Batch.tx_id
+    FROM
+        (SELECT ts, tx_id, frequentEqualOutputCount FROM firststep) First_Batch
+        INNER JOIN  
+
+                (SELECT         ts,
+                                tx_id, 
+                                COUNT(ts)/COUNT(DISTINCT CONCAT(output_to_id, value)) inputs
+                        
+                FROM       `btc.bitcoin_mapped_int`
+                
+                WHERE       ts >= TIMESTAMP("2019-12-27 11:53:00+00")
+                
+                GROUP BY    ts, tx_id) Second_Batch 
+
+                ON          First_Batch.tx_id = Second_Batch.tx_id
+
+        WHERE Second_Batch.inputs >= First_Batch.frequentEqualOutputCount 
+),
+
+thirdstep AS (
+    SELECT DISTINCT ts, tx_id
+    FROM
+        (SELECT ts, tx_id FROM secondstep 
+        WHERE tx_id IN (
+            SELECT DISTINCT tx_id
+                FROM(
+                    SELECT tx_id, COUNT(tx_id) c2 FROM (
+                        SELECT      tx_id,
+                                    value,
+                                    COUNT(DISTINCT CONCAT(output_to_id, value)) c
+                                
+                        FROM       `btc.bitcoin_mapped_int`
+                        
+                        WHERE       ts >= TIMESTAMP("2019-12-27 11:53:47+00")
+                        
+                        GROUP BY    tx_id,
+                                    value
+                        HAVING      c = 1) 
+
+                    GROUP BY    tx_id
+                    HAVING      c2 >= 2))
+
+        AND tx_id   NOT IN (SELECT IDS.id FROM
+                           (SELECT DISTINCT     tx_id, 
+                                                input_from_id, 
+                                                output_to_id 
+                            FROM               `btc.bitcoin_mapped_int`
+                            WHERE               ts >= TIMESTAMP("2019-12-27 11:53:00+00")
+                            AND                (input_from_id IN (SELECT id FROM nonsegwits) 
+                            OR                  output_to_id  IN (SELECT id FROM nonsegwits))) Non_Segwits
+                            INNER JOIN 
+                           (SELECT              id, 
+                                                tx_id
+                            FROM               `btc.ids_transactions`) IDS 
+                            ON                  Non_Segwits.tx_id = IDS.id)
+        AND tx_id NOT IN (SELECT DISTINCT tx_id
+
+                                 FROM(SELECT tx_id,
+                                             value
+                                                
+                                      FROM `btc.bitcoin_mapped_int`
+                                        
+                                      WHERE ts >= TIMESTAMP("2019-12-27 11:53:00+00")
+                                        
+                                      AND  (value BETWEEN 800000 AND 850000 OR
+                                            value BETWEEN 1150000 AND 1200000 OR 
+                                            value = 900000 OR 
+                                            value = 1000000 OR 
+                                            value = 1100000)))))
+SELECT ts, tx_id FROM thirdstep;
+
+# Samurai CoinJoin Heuristik 1
+#
+# https://github.com/nopara73/Dumplings/blob/master/Dumplings/Scanning/Scanner.cs
+
+CREATE OR REPLACE TABLE `btc.coinj_samurai_1_int` AS
+WITH samurais AS 
+   (SELECT      AA.ts,
+                AA.tx_id, 
+                BB.value 
+    FROM       (SELECT DISTINCT     ts,
+                                    tx_id, 
+                                    input_tx_id, 
+                                    vout
+                FROM               `btc.bitcoin_int`
+                WHERE               ts >= TIMESTAMP("2019-04-03 09:20:00+00")
+                AND                 tx_id IN  (SELECT DISTINCT A.tx_id
+                                                FROM
+                                                    # 5 Inputs AND Outputs
+                                                   (SELECT   tx_id,
+                                                             COUNT(tx_id)/5 input_addresses,
+                                                             COUNT(DISTINCT output_to_id) output_addresses  
+                                                    FROM    `btc.bitcoin_mapped_int`
+                                                    WHERE    ts >= TIMESTAMP("2019-04-03 09:20:00+00")
+                                                    GROUP BY tx_id
+                                                    HAVING   input_addresses  = 5
+                                                    AND      output_addresses <= 5) A 
+                                                    
+                                                    INNER JOIN 
+
+                                                   (SELECT   tx_id,
+                                                             SUM(value)/25 val
+                                                    FROM    `btc.bitcoin_mapped_int`
+                                                    WHERE    ts >= TIMESTAMP("2019-04-03 09:20:00+00")
+                                                    AND     (value = 100000 
+                                                    OR       value = 1000000
+                                                    OR       value = 5000000
+                                                    OR       value = 50000000)
+                                                    GROUP BY tx_id
+                                                    HAVING  (val = 100000 
+                                                    OR       val = 1000000
+                                                    OR       val = 5000000
+                                                    OR       val = 50000000)) B ON A.tx_id = B.tx_id)
+                                                    ) AA
+                # Join input values to tx hash
+                INNER JOIN 
+
+               (SELECT      DISTINCT value, 
+                            tx_id, 
+                            output_index 
+                FROM       `btc.bitcoin_int`) BB 
+                
+                ON          BB.tx_id = AA.input_tx_id 
+                AND         BB.output_index = AA.vout)
+
+, nonsegwits AS (
+    SELECT address, id FROM `btc.ids_addresses`
+    WHERE address NOT LIKE "bc1q%"
+)
+# Actual Query
+
+SELECT DISTINCT plainhashes.ts, ids.id as tx_id  FROM(
+    SELECT non_segwits.ts, non_segwits.tx_id 
+    FROM(
+            SELECT  poolsize.ts,
+                    poolsize.tx_id 
+            FROM(   SELECT      ts,
+                                tx_id, 
+                                value 
+                    FROM        samurais
+                    WHERE      (value = 100000  OR 
+                                value = 1000000 OR 
+                                value = 5000000 OR 
+                                value = 50000000)
+                    GROUP BY    ts, tx_id, value
+                    HAVING      COUNT(ts) BETWEEN 1 AND 3) poolsize
+
+            INNER JOIN
+
+           (SELECT      tx_id, 
+                        value 
+                FROM    samurais
+                WHERE ((value BETWEEN 100000-110000   AND 100000+110000   )     OR 
+                       (value BETWEEN 1000000-110000  AND 1000000+110000  )     OR 
+                       (value BETWEEN 5000000-110000  AND 5000000+110000  )     OR 
+                       (value BETWEEN 50000000-110000 AND 50000000+110000 ))    AND
+                        value != 100000  AND
+                        value != 1000000 AND
+                        value != 5000000 AND
+                        value != 50000000
+            GROUP BY    tx_id, value
+            HAVING      COUNT(tx_id) BETWEEN 2 AND 4) remainders 
+        
+            ON          poolsize.tx_id = remainders.tx_id) non_segwits
+        
+            # @dev - no effect
+            WHERE       non_segwits.tx_id NOT IN ( SELECT DISTINCT     tx_id, 
+                                                    FROM               `btc.bitcoin_mapped_int`
+                                                    WHERE               ts >= TIMESTAMP("2019-04-03 09:20:00+00") 
+                                                    AND                (input_from_id IN (SELECT id FROM nonsegwits) 
+                                                    OR                  output_to_id  IN (SELECT id FROM nonsegwits)))) plainhashes
+
+# Tx hashes -> IDs
+LEFT JOIN  `btc.ids_transactions` ids 
+ON          plainhashes.tx_id = ids.id;
+
+
+# Merge CoinJoin transaction
+
+CREATE OR REPLACE TABLE `btc.coinj_all_int` AS
+SELECT DISTINCT tx_id, name FROM
+   (SELECT tx_id, "wasabi"  as name FROM `btc.coinj_wasabi_1_int`) 
+    UNION ALL  
+   (SELECT tx_id, "wasabi"  as name FROM `btc.coinj_wasabi_2_int`) 
+    UNION ALL 
+   (SELECT tx_id, "samurai" as name FROM `btc.coinj_samurai_1_int`);
+
+# Exclude CoinJoin Transactions
+
+CREATE OR REPLACE TABLE btc.bitcoin_mapped_int_WCJ  (ts TIMESTAMP, 
+                                                     tx_id INT64, 
+                                                     input_from_id INT64,
+                                                     output_to_id INT64,
+                                                     value INT64
+                                                     )
+
+PARTITION BY    DATE_TRUNC(ts, MONTH)   AS 
+SELECT  ts,
+        tx_id,
+        input_from_id,
+        output_to_id, 
+        value
+FROM
+       (SELECT          AllTx.*, 
+                        IFNULL(CoinJoins.coinjoin, 0) coinjoin
+        FROM           (SELECT *   FROM   `btc.bitcoin_mapped_int` ) AllTx
+        LEFT JOIN      (SELECT     tx_id, 
+                                   1 AS coinjoin 
+                        FROM      `btc.coinj_all_int`) CoinJoins 
+        ON              AllTx.tx_id = CoinJoins.tx_id)
+
+WHERE   coinjoin = 0;
+
+
+# COINJOINS
+#
+# Coinjoin txs, edges and output addresses
+# over month per service provider
+
+CREATE OR REPLACE TABLE `btc.coinj_metrics_over_time` AS
+WITH cjs AS (
+    SELECT tx_id, name FROM `btc.coinj_all_int`
+)
+
+SELECT  EXTRACT(YEAR  FROM ts)  year,
+        EXTRACT(MONTH FROM A.ts)  month, 
+        B.name, 
+        COUNT(B.name) edges,
+        COUNT(DISTINCT A.tx_id) txs,
+        COUNT(DISTINCT A.output_to_id) distinct_outputs
+FROM(   SELECT * FROM `btc.bitcoin_mapped_int`
+        WHERE tx_id IN (SELECT tx_id FROM cjs)
+    ) A
+LEFT JOIN(
+       SELECT tx_id, name FROM cjs
+    ) B 
+ON A.tx_id = B.tx_id
+GROUP BY year, month, B.name
+ORDER BY year, month;
+
+CREATE OR REPLACE TABLE `btc.coinj_total_per_provider` AS
+SELECT "wasabi" AS name, COUNT(DISTINCT tx_id) txs FROM(
+    SELECT DISTINCT tx_id FROM `btc.coinj_wasabi_1_int` 
+    UNION ALL 
+    SELECT DISTINCT tx_id FROM `btc.coinj_wasabi_2_int` )
+UNION ALL
+SELECT "samurai" AS name, COUNT(DISTINCT tx_id) FROM `btc.coinj_samurai_1_int`;
+
+
+CREATE OR REPLACE TABLE `btc.coinj_per_blk` AS
+        
+        SELECT  A.blk_file_nr,
+                COUNT(A.tx_id) total_edges, 
+                SUM(B.CJ) cj_edges,
+                ROUND(SUM(B.CJ)/COUNT(A.tx_id)*100, 2) cj_share
+        FROM (
+        SELECT tx_id, blk_file_nr
+        FROM   `btc.bitcoin_int` 
+        WHERE   ts >= TIMESTAMP("2018-07-05 00:03:00+00")) A
+        LEFT JOIN (
+                SELECT DISTINCT tx_id, 1 AS CJ
+                FROM   `btc.coinj_all_int`
+        ) B ON  A.tx_id = B.tx_id
+
+        GROUP BY A.blk_file_nr
+        ORDER BY cj_share DESC;
+        
+        
+# COINJOINS
+#
+# Coinjoin Stats
+
+
+CREATE OR REPLACE TABLE `btc.coinj_stats` AS
+WITH cjs AS (
+    SELECT tx_id, name FROM `btc.coinj_all_int`
+)
+
+SELECT  B.name, 
+        AVG(value) avg_value, 
+        SUM(value) total_value, 
+        VARIANCE(value) var_value,
+        COUNT(DISTINCT B.tx_id) total_txs, 
+        SUM(A.edges) total_edges, 
+        AVG(outputs) avg_nr_outputs
+        
+FROM(   SELECT      tx_id, 
+                    COUNT(DISTINCT output_to_id) outputs, 
+                    SUM(value)/COUNT(DISTINCT CONCAT(output_to_id, value))/100000000 value, 
+                    COUNT(value) edges 
+        FROM       `btc.bitcoin_mapped_int`
+        WHERE       tx_id IN (SELECT DISTINCT tx_id FROM cjs)
+        GROUP BY    tx_id
+    ) A
+INNER JOIN(
+       SELECT tx_id, name FROM cjs
+    ) B 
+ON A.tx_id = B.tx_id
+
+GROUP BY name;
+
+
+# Usergraph preparation
+#
+
+# New ID -> Address Mapping for Clustering
+
+CREATE OR REPLACE TABLE `btc.ids_usergraph_UG` AS
+
+SELECT    address, id, id AS clusterid
+
+FROM     `btc.ids_addresses`;
+
+# Another one for the conjoin-adjusted tx graph
+CREATE OR REPLACE TABLE `btc.ids_usergraph_WCJ` AS
+
+SELECT    address, id, id AS clusterid
+
+FROM     `btc.ids_addresses`;
+
+# Another one for the one with services
+CREATE OR REPLACE TABLE `btc.ids_services` AS
+SELECT DISTINCT A.address, A.id, A.id AS clusterid, B.service FROM
+    (SELECT id, address FROM `btc.ids_addresses`) A
+    LEFT JOIN 
+    (SELECT service, address FROM `btc.services`) B on A.address = B.address;
+    
+
+# LINK  UG
+# Create list of linking hashes (hashes that can be linked to other hashes)
+#
+# Remove Transactions that do not have more than 1 Inputs
+
+CREATE OR REPLACE TABLE `btc.usergraph_links_UG` AS
+
+WITH mapping AS (
+    SELECT DISTINCT ts, tx_id, input_from_id FROM `btc.bitcoin_mapped_int`
+)
+, linking_hashes AS (
+    SELECT DISTINCT ts,
+                    tx_id, 
+                    input_from_id
+
+    FROM            mapping
+    WHERE tx_id IN (
+        SELECT      tx_id
+        FROM        mapping
+        GROUP BY    tx_id
+        HAVING      COUNT(DISTINCT input_from_id)  > 1
+    )
+)
+
+# Remove rows with inputs that are not in two different transactions
+
+SELECT DISTINCT     ts,
+                    tx_id, 
+                    input_from_id
+
+FROM       linking_hashes
+
+    WHERE input_from_id IN (
+        SELECT DISTINCT input_from_id
+        FROM            linking_hashes 
+        GROUP BY        input_from_id
+        HAVING          COUNT(DISTINCT tx_id) > 1 
+    );
+ 
+ 
+# LINK UG^-CJ
+# Create list of linking hashes (hashes that can be linked to other hashes)
+#
+# Remove Transactions that do not have more than 1 Inputs
+
+CREATE OR REPLACE TABLE `btc.usergraph_links_WCJ` AS
+
+WITH mapping AS (
+    SELECT DISTINCT ts, tx_id, input_from_id FROM `btc.bitcoin_mapped_int_WCJ`
+)
+, linking_hashes AS (
+    SELECT DISTINCT ts,
+                    tx_id, 
+                    input_from_id
+
+    FROM            mapping
+    WHERE tx_id IN (
+        SELECT      tx_id
+        FROM        mapping
+        GROUP BY    tx_id
+        HAVING      COUNT(DISTINCT input_from_id)  > 1
+    )
+)
+
+# Remove rows with inputs that are not in two different transactions
+
+SELECT DISTINCT     ts,
+                    tx_id, 
+                    input_from_id
+
+FROM       linking_hashes
+
+    WHERE input_from_id IN (
+        SELECT DISTINCT input_from_id
+        FROM            linking_hashes 
+        GROUP BY        input_from_id
+        HAVING          COUNT(DISTINCT tx_id) > 1 
+    );
+    
+    
+ # INITIAL CLUSTERING USER GRAPH
+###############################
+
+UPDATE `btc.ids_usergraph_UG` uga
+SET clusterid = min_id 
+FROM (  SELECT  B.input_from_id, 
+                MIN(A.min_id) min_id 
+        FROM (
+                SELECT DISTINCT tx_id, 
+                                MIN(clusterid) min_id 
+                FROM (
+                                SELECT DISTINCT tx_id, 
+                                                input_from_id 
+                                FROM           `btc.bitcoin_mapped_int`
+                    )txg
+                LEFT JOIN  (
+                    SELECT  id, 
+                            clusterid 
+                    FROM   `btc.ids_usergraph_UG`) userg 
+
+                ON          txg.input_from_id = userg.id
+                GROUP BY    tx_id) A
+
+        INNER JOIN (
+            SELECT DISTINCT tx_id,
+                            input_from_id 
+            FROM           `btc.bitcoin_mapped_int`) B 
+        
+        ON A.tx_id = B.tx_id
+        GROUP BY B.input_from_id) clustertable
+
+WHERE   uga.id = clustertable.input_from_id
+AND     uga.clusterid > clustertable.min_id;
+
+
+# INITIAL CLUSTERING USER GRAPH^-CJ
+###############################
+
+UPDATE `btc.ids_usergraph_WCJ` uga
+SET clusterid = min_id 
+FROM (  SELECT  B.input_from_id, 
+                MIN(A.min_id) min_id 
+        FROM (
+                SELECT DISTINCT txhash_id, 
+                                MIN(clusterid) min_id 
+                FROM (
+                                SELECT DISTINCT txhash_id, 
+                                                input_from_id 
+                                FROM           `btc.bitcoin_mapped_int_WCJ`
+                    )txg
+                LEFT JOIN  (
+                    SELECT  id, 
+                            clusterid 
+                    FROM   `btc.ids_usergraph_WCJ`) userg 
+
+                ON          txg.input_from_id = userg.id
+                GROUP BY    txhash_id) A
+
+        INNER JOIN (
+            SELECT DISTINCT txhash_id,
+                            input_from_id 
+            FROM           `btc.bitcoin_mapped_int_WCJ`) B 
+        
+        ON A.txhash_id = B.txhash_id
+        GROUP BY B.input_from_id) clustertable
+
+WHERE   uga.id = clustertable.input_from_id
+AND     uga.clusterid > clustertable.min_id;
+
+
+# CLUSTERING PREPARATION USER GRAPH
+###################################
+
+CREATE OR REPLACE TABLE `btc.temp_links_UG` AS
+SELECT DISTINCT     tx_id,
+                    input_from_id,
+FROM               `btc.bitcoin_mapped_int`
+WHERE               tx_id IN (SELECT DISTINCT tx_id FROM `btc.usergraph_links_UG`)
+ORDER BY            tx_id;
+
+CREATE OR REPLACE TABLE `btc.temp_ids_approx_UG` AS
+SELECT  id, 
+        clusterid 
+FROM   `btc.ids_usergraph_UG` 
+WHERE   id IN (SELECT DISTINCT  input_from_id 
+               FROM            `btc.temp_usergraph_links_UG`);
+               
+               
+ # CLUSTERING PREPARATION USER GRAPH^-CJ
+#######################################
+
+CREATE OR REPLACE TABLE `btc.temp_links_WCJ` AS
+SELECT DISTINCT     tx_id,
+                    input_from_id,
+FROM               `btc.bitcoin_mapped_int_WCJ`
+WHERE               tx_id IN (SELECT DISTINCT tx_id FROM `btc.usergraph_links_WCJ`)
+ORDER BY            tx_id;
+
+CREATE OR REPLACE TABLE `btc.temp_ids_approx_WCJ` AS
+SELECT  id, 
+        clusterid 
+FROM   `btc.ids_usergraph_WCJ` 
+WHERE   id IN (SELECT DISTINCT  input_from_id 
+               FROM            `btc.temp_links_WCJ`);
+
+DECLARE n int64 DEFAULT 0;
+DECLARE m int64 DEFAULT 9;
+
+
+WHILE n <= m DO
+# ONLY LINKING TRANSACTIONS WITH CONNECTIONS THROUGH COMMON INPUTS
+UPDATE `btc.ids_usergraph_approx_UG` uga
+SET clusterid = min_id 
+FROM (  SELECT  B.input_from_id, 
+                MIN(A.min_id) min_id 
+        FROM (
+                SELECT DISTINCT tx_id, 
+                                MIN(clusterid) min_id 
+                FROM (  SELECT DISTINCT     tx_id, 
+                                            input_from_id 
+                        FROM               `btc.temp_usergraph_links_UG`) txg
+                        LEFT JOIN (
+                        SELECT              id, 
+                                            clusterid 
+                        FROM               `btc.ids_usergraph_approx_UG`) userg 
+
+                ON          txg.input_from_id = userg.id
+                GROUP BY    tx_id) A
+
+        INNER JOIN (
+            SELECT DISTINCT tx_id,
+                            input_from_id 
+            FROM           `btc.temp_usergraph_links_UG`) B 
+        
+        ON          A.tx_id = B.tx_id
+        GROUP BY    B.input_from_id) clustertable
+
+WHERE   uga.id = clustertable.input_from_id
+AND     uga.clusterid <> clustertable.min_id;
+SET     n = n + 1;
+END WHILE;
+
+
+DECLARE n int64 DEFAULT 0;
+DECLARE m int64 DEFAULT 2;
+
+WHILE n <= m DO
+# ONLY LINKING TRANSACTIONS WITH CONNECTIONS THROUGH COMMON INPUTS
+UPDATE `btc.ids_usergraph_approx_WCJ` uga
+SET clusterid = min_id 
+FROM (  SELECT  B.input_from_id, 
+                MIN(A.min_id) min_id 
+        FROM (
+                SELECT DISTINCT tx_id, 
+                                MIN(clusterid) min_id 
+                FROM (  SELECT DISTINCT     tx_id, 
+                                            input_from_id 
+                        FROM               `btc.temp_usergraph_links_WCJ`) txg
+                        LEFT JOIN (
+                        SELECT              id, 
+                                            clusterid 
+                        FROM               `btc.ids_usergraph_approx_WCJ`) userg 
+
+                ON          txg.input_from_id = userg.id
+                GROUP BY    tx_id) A
+
+        INNER JOIN (
+            SELECT DISTINCT tx_id,
+                            input_from_id 
+            FROM           `btc.temp_usergraph_links_WCJ`) B 
+        
+        ON          A.tx_id = B.tx_id
+        GROUP BY    B.input_from_id) clustertable
+
+WHERE   uga.id = clustertable.input_from_id
+AND     uga.clusterid > clustertable.min_id;
+SET     n = n + 1;
+END WHILE;
+
+DECLARE n int64 DEFAULT 0;
+DECLARE m int64 DEFAULT 2;
+
+WHILE n <= m DO
+# ONLY LINKING TRANSACTIONS WITH CONNECTIONS THROUGH COMMON INPUTS
+UPDATE `btc.ids_usergraph_approx_WCJ` uga
+SET clusterid = min_id 
+FROM (  SELECT  B.input_from_id, 
+                MIN(A.min_id) min_id 
+        FROM (
+                SELECT DISTINCT tx_id, 
+                                MIN(clusterid) min_id 
+                FROM (  SELECT DISTINCT     tx_id, 
+                                            input_from_id 
+                        FROM               `btc.temp_usergraph_links_WCJ`) txg
+                        LEFT JOIN (
+                        SELECT              id, 
+                                            clusterid 
+                        FROM               `btc.ids_usergraph_approx_WCJ`) userg 
+
+                ON          txg.input_from_id = userg.id
+                GROUP BY    tx_id) A
+
+        INNER JOIN (
+            SELECT DISTINCT tx_id,
+                            input_from_id 
+            FROM           `btc.temp_usergraph_links_WCJ`) B 
+        
+        ON          A.tx_id = B.tx_id
+        GROUP BY    B.input_from_id) clustertable
+
+WHERE   uga.id = clustertable.input_from_id
+AND     uga.clusterid > clustertable.min_id;
+SET     n = n + 1;
+END WHILE;
+
+UPDATE `btc.ids_usergraph_without_cj` uga
+SET clusterid = min_id FROM (
+    SELECT id, clusterid AS min_id FROM `btc.ids_usergraph_without_cj_approx` 
+) approx
+WHERE   uga.id = approx.id AND
+        uga.clusterid > approx.min_id
+
+# CLUSTERING PREPARATION USER GRAPH^-CJ
+#######################################
+
+CREATE OR REPLACE TABLE `btc.temp_ids_approx_services_WCJ` AS
+SELECT  id, 
+        clusterid,
+        service
+FROM   `btc.ids_services` 
+WHERE   id IN (SELECT DISTINCT  input_from_id 
+               FROM            `btc.temp_links_WCJ`);
+
+
+DECLARE n int64 DEFAULT 0;
+DECLARE m int64 DEFAULT 3;
+
+
+WHILE n <= m DO
+UPDATE `btc.temp_ids_approx_services_WCJ` ol
+SET service = _service
+  , clusterid = min_id FROM (
+    SELECT DISTINCT BB.input_from_id AS id, MIN(AA.clusterid) AS min_id, AA.service AS _service FROM
+        (SELECT DISTINCT A.tx_id, MIN(B.clusterid) clusterid, B.service FROM
+            (SELECT tx_id, input_from_id  FROM `btc.temp_links_WCJ`) A
+            INNER JOIN 
+            (SELECT id, clusterid, service FROM `btc.temp_ids_approx_services_WCJ` 
+             WHERE service IS NOT NULL
+            ) B 
+            ON B.id = A.input_from_id
+        GROUP BY tx_id, service) AA
+        LEFT JOIN 
+        (SELECT tx_id, input_from_id  FROM `btc.temp_links_WCJ`) BB on BB.tx_id = AA.tx_id
+    GROUP BY id, _service) up
+WHERE ol.id = up.id
+AND (ol.clusterid <> up.min_id OR ol.service <> up._service)
+AND up.id NOT IN (SELECT DISTINCT BB.input_from_id AS id FROM
+                                            (SELECT DISTINCT A.tx_id, B.service FROM
+                                                (SELECT tx_id, input_from_id  FROM `btc.temp_links_WCJ`) A
+                                                INNER JOIN 
+                                                (SELECT id, service FROM `btc.temp_ids_approx_services_WCJ` WHERE service IS NOT NULL) B ON B.id = A.input_from_id
+                                            GROUP BY tx_id, service) AA
+                                            LEFT JOIN 
+                                            (SELECT tx_id, input_from_id  FROM `btc.temp_links_WCJ`) BB on BB.tx_id = AA.tx_id
+                                        GROUP BY id
+                                        HAVING COUNT(DISTINCT AA.service) > 1);
+
+SET     n = n + 1;
+END WHILE;
+
+
+
+# Every clusterid shares the same service
+UPDATE `btc.temp_ids_approx_services_WCJ` ol
+SET service = _service FROM (
+    SELECT B.id, A.service AS _service FROM
+            (SELECT DISTINCT clusterid, service FROM `btc.temp_ids_approx_services_WCJ` 
+             WHERE service IS NOT NULL
+            ) A 
+            INNER JOIN 
+            (SELECT id, clusterid FROM `btc.temp_ids_approx_services_WCJ` WHERE service IS NULL) B ON B.clusterid = A.clusterid) up
+WHERE ol.id = up.id;
+
+
+# Init Service
+# Update all non-known clusters
+UPDATE `btc.temp_ids_approx_services_WCJ` uga
+SET clusterid = min_id 
+    FROM (  
+        SELECT DISTINCT input_from_id,
+                        min_id
+        FROM (
+            SELECT  B.input_from_id, 
+                    MIN(A.min_id) min_id 
+            FROM (
+                    SELECT DISTINCT tx_id, 
+                                    MIN(clusterid) min_id 
+                    FROM (  SELECT DISTINCT     tx_id, 
+                                                input_from_id 
+                            FROM               `btc.temp_links_WCJ`) txg
+                            LEFT JOIN (
+                            SELECT              id, 
+                                                clusterid 
+                            FROM               `btc.temp_ids_approx_services_WCJ`) userg 
+
+                    ON          txg.input_from_id = userg.id
+                    GROUP BY    tx_id) A
+
+            INNER JOIN (
+                SELECT DISTINCT tx_id,
+                                input_from_id 
+                FROM           `btc.temp_links_WCJ`) B 
+            
+            ON          A.tx_id = B.tx_id
+            GROUP BY    B.input_from_id)
+        WHERE       input_from_id NOT IN (SELECT id FROM `btc.temp_ids_approx_services_WCJ` WHERE service IS NOT NULL)) clustertable
+
+WHERE   uga.id = clustertable.input_from_id
+AND     uga.clusterid <> clustertable.min_id;
+   
+
+
+
+UPDATE `btc.ids_services` uga
+SET clusterid = min_id,
+    service = new_service 
+FROM (
+    SELECT id, clusterid AS min_id, service AS new_service FROM `btc.temp_ids_approx_services_WCJ` 
+) approx
+WHERE   uga.id = approx.id AND
+        uga.clusterid <> approx.min_id;
+        
+   
+   
+# New Mapping with users instead of addresses
+
+CREATE OR REPLACE TABLE   `btc.usergraph_mapped_int` (ts TIMESTAMP, 
+                                                      tx_id INT64,
+                                                      input_from_id INT64, 
+                                                      output_to_id INT64,
+                                                      value INT64
+                                                     )
+
+PARTITION BY    DATE_TRUNC(ts, MONTH)    AS 
+SELECT  AGG.ts,
+        AGG.tx_id,
+        AGG.input_from_id,
+        AGG.output_to_id,
+        SUM(AGG.value) value
+FROM
+    (SELECT DISTINCT DS.ts,
+                    DS.tx_id   AS tx_id, 
+                    Addr_ID_I.clusterid AS input_from_id, 
+                    DS.output_to_id AS output_to_id_old,
+                    DS.output_index AS output_index_old,
+                    Addr_ID_O.clusterid AS output_to_id,
+                    DS.value value
+                    
+    FROM
+                (SELECT      ts, 
+                                tx_id, 
+                                input_from_id, 
+                                output_to_id,
+                                output_index,
+                                value
+                    FROM       `btc.bitcoin_mapped_int`)   DS
+
+                    LEFT JOIN (
+                        SELECT  id, clusterid FROM `btc.ids_users`)       Addr_ID_I 
+                    ON  DS.input_from_id = Addr_ID_I.id
+
+                    LEFT JOIN (
+                        SELECT  id, clusterid FROM `btc.ids_users`)       Addr_ID_O 
+                    ON  DS.output_to_id  = Addr_ID_O.id
+) AGG
+GROUP BY ts, tx_id, input_from_id, output_to_id;
+
+
+# New Mapping with users instead of addresses
+
+CREATE OR REPLACE TABLE `btc.bitcoin_usergraph`         (ts TIMESTAMP, 
+                                                         tx_id INT64,
+                                                         input_from_id INT64, 
+                                                         output_to_id INT64,
+                                                         value INT64
+                                                         )
+
+PARTITION BY    DATE_TRUNC(ts, MONTH)    AS 
+SELECT DISTINCT DS.ts,
+                DS.tx_id   AS tx_id, 
+                Addr_ID_I.clusterid AS input_from_id, 
+                Addr_ID_O.clusterid AS output_to_id,
+                CAST(AVG(DS.value)  AS INT) value
+                
+FROM
+               (SELECT      ts, 
+                            tx_id, 
+                            input_from_id, 
+                            output_to_id,
+                            value
+                            # Needs to be the normal mapping since it would have no sense otherwise
+                FROM       `btc.bitcoin_mapped_int`)   DS
+
+                LEFT JOIN (
+                    SELECT  id, clusterid FROM `btc.ids_users`)       Addr_ID_I 
+                ON  DS.input_from_id = Addr_ID_I.id
+
+                LEFT JOIN (
+                    SELECT  id, clusterid FROM `btc.ids_users`)       Addr_ID_O 
+                ON  DS.output_to_id  = Addr_ID_O.id
+GROUP BY ts, tx_id, input_from_id, output_to_id;
+
+CREATE OR REPLACE TABLE `btc.usergraph_clustersizes_UG` AS
+SELECT      clusterid, 
+            COUNT(DISTINCT address) clustersize 
+FROM       `btc.ids_usergraph` 
+GROUP BY    clusterid   
+ORDER BY    clustersize DESC;
+
+CREATE OR REPLACE TABLE `btc.usergraph_clustersizes_distribution_UG` AS
+SELECT      clustersize, 
+            COUNT(*) occurencies 
+FROM       `btc.usergraph_clustersizes_UG` 
+GROUP BY    clustersize   
+ORDER BY    occurencies DESC;
+
+CREATE OR REPLACE TABLE `btc.usergraph_clustersizes_WCJ` AS
+SELECT      clusterid, 
+            COUNT(DISTINCT address) clustersize 
+FROM       `btc.ids_usergraph_WCJ` 
+GROUP BY    clusterid   
+ORDER BY    clustersize DESC;
+
+CREATE OR REPLACE TABLE `btc.usergraph_clustersizes_distribution_WCJ` AS
+SELECT      clustersize, 
+            COUNT(*) occurencies 
+FROM       `btc.usergraph_clustersizes_WCJ` 
+GROUP BY    clustersize   
+ORDER BY    occurencies DESC;
+
+
+# Stats on activity
+
+
+# Public Keys
+CREATE OR REPLACE TABLE `btc.temp_pubk_active_time` AS
+
+WITH activity_period AS (
+    SELECT      input_from_id, 
+                MIN(ts) first_seen, 
+                MAX(ts) last_seen 
+    FROM       `btc.bitcoin_mapped_int` 
+    GROUP BY    input_from_id
+    )
+SELECT      input_from_id,
+            DATE_DIFF(last_seen, first_seen, DAY) active_days
+FROM        activity_period;
+
+# Users
+CREATE OR REPLACE TABLE `btc.temp_user_active_time` AS
+
+WITH activity_period AS (
+    SELECT      input_from_id, 
+                MIN(ts) first_seen, 
+                MAX(ts) last_seen 
+    FROM       `btc.usergraph_mapped_int_WCJ` 
+    GROUP BY    input_from_id
+    )
+SELECT      input_from_id,
+            DATE_DIFF(last_seen, first_seen, DAY) active_days
+FROM        activity_period;
+
+##########
+
+# STATS
+CREATE OR REPLACE TABLE `btc.stats_active_time_G` AS
+SELECT          active_days,
+                COUNT(active_days) occurencies
+FROM           `btc.temp_pubk_active_time`  
+GROUP BY        active_days          
+ORDER BY        active_days;
+# Activity distribution
+CREATE OR REPLACE TABLE `btc.stats_active_time_avg_G` AS
+SELECT          AVG(active_days) avg_activity,
+                VARIANCE(active_days) var_activity
+FROM           `btc.temp_pubk_active_time`;
+
+
+
+CREATE OR REPLACE TABLE `btc.stats_active_time_WCJ` AS
+SELECT          active_days,
+                COUNT(active_days) occurencies
+FROM           `btc.temp_user_active_time`  
+GROUP BY        active_days          
+ORDER BY        active_days;
+
+# Activity distribution
+CREATE OR REPLACE TABLE `btc.stats_active_time_avg_WCJ` AS
+SELECT          AVG(active_days) avg_activity,
+                VARIANCE(active_days) var_activity
+FROM           `btc.temp_user_active_time`;
+
+#
+# (Cumulated) Active Node Count
+# 
+# Coinbase transactions are excluded
+
+DECLARE n int64 DEFAULT 2009;
+DECLARE m int64 DEFAULT 2021;
+
+# Cumulated stats
+CREATE OR REPLACE TABLE     `btc.stats_active_pubkeys_cum` AS
+
+(SELECT               n  AS year,  NULL c 
+          UNION ALL   SELECT n+1,  NULL   
+          UNION ALL   SELECT n+2,  NULL   
+          UNION ALL   SELECT n+3,  NULL   
+          UNION ALL   SELECT n+4,  NULL    
+          UNION ALL   SELECT n+5,  NULL   
+          UNION ALL   SELECT n+6,  NULL   
+          UNION ALL   SELECT n+7,  NULL   
+          UNION ALL   SELECT n+8,  NULL   
+          UNION ALL   SELECT n+9,  NULL   
+          UNION ALL   SELECT n+10, NULL   
+          UNION ALL   SELECT n+11, NULL   
+          UNION ALL   SELECT n+12, NULL   
+          UNION ALL   SELECT n+13, NULL   
+ORDER BY year);
+
+CREATE OR REPLACE TABLE     `btc.stats_active_user_wcj_cum` AS
+
+(SELECT               n  AS year,  NULL c 
+          UNION ALL   SELECT n+1,  NULL   
+          UNION ALL   SELECT n+2,  NULL   
+          UNION ALL   SELECT n+3,  NULL   
+          UNION ALL   SELECT n+4,  NULL    
+          UNION ALL   SELECT n+5,  NULL   
+          UNION ALL   SELECT n+6,  NULL   
+          UNION ALL   SELECT n+7,  NULL   
+          UNION ALL   SELECT n+8,  NULL   
+          UNION ALL   SELECT n+9,  NULL   
+          UNION ALL   SELECT n+10, NULL   
+          UNION ALL   SELECT n+11, NULL   
+          UNION ALL   SELECT n+12, NULL   
+          UNION ALL   SELECT n+13, NULL   
+ORDER BY year);
+
+
+CREATE OR REPLACE TABLE     `btc.stats_active_user_ug_cum` AS
+
+(SELECT               n  AS year,  NULL c  
+          UNION ALL   SELECT n+1,  NULL   
+          UNION ALL   SELECT n+2,  NULL   
+          UNION ALL   SELECT n+3,  NULL   
+          UNION ALL   SELECT n+4,  NULL    
+          UNION ALL   SELECT n+5,  NULL   
+          UNION ALL   SELECT n+6,  NULL   
+          UNION ALL   SELECT n+7,  NULL   
+          UNION ALL   SELECT n+8,  NULL   
+          UNION ALL   SELECT n+9,  NULL   
+          UNION ALL   SELECT n+10, NULL   
+          UNION ALL   SELECT n+11, NULL   
+          UNION ALL   SELECT n+12, NULL   
+          UNION ALL   SELECT n+13, NULL   
+ORDER BY year);
+
+# From n to m
+WHILE n <= m DO
+
+    #UPDATE   `btc.stats_active_pubkeys_cum`  f
+
+    #SET       c = pubkeys FROM (SELECT COUNT(DISTINCT input_from_id) pubkeys, 
+
+                                      #FROM  `btc.bitcoin_mapped_int` 
+
+                                      #WHERE EXTRACT(YEAR FROM ts) <= n)
+   
+    #WHERE     f.year = n;
+
+
+    UPDATE   `btc.stats_active_user_ug_cum`  g
+
+    SET       c = pubkeys FROM (SELECT COUNT(DISTINCT input_from_id) pubkeys, 
+
+                                      FROM  `btc.usergraph_mapped_int` 
+
+                                      WHERE EXTRACT(YEAR FROM ts) <= n)
+   
+    WHERE     g.year = n;
+
+
+    UPDATE   `btc.stats_active_user_wcj_cum`  h
+
+    SET       c = pubkeys FROM (SELECT COUNT(DISTINCT input_from_id) pubkeys, 
+
+                                      FROM  `btc.usergraph_mapped_int_without_cj` 
+
+                                      WHERE EXTRACT(YEAR FROM ts) <= n)
+   
+    WHERE     h.year = n;
+
+    SET       n = n + 1;
+
+END WHILE;
+
+# Create summary table with all three (PUBKEYs NOT USED)
+CREATE OR REPLACE TABLE `btc.stats_summary` AS
+SELECT  A.year, 
+        #A.c AS pubkey, 
+        B.c AS users, 
+        C.c AS users_wcj 
+FROM (
+    SELECT  year, 
+            #c 
+    FROM `btc.stats_active_pubkeys_cum`
+) A 
+LEFT JOIN (
+    SELECT year, c FROM `btc.stats_active_user_ug_cum`
+) B ON A.year = B.year 
+LEFT JOIN (
+    SELECT year, c FROM `btc.stats_active_user_wcj_cum`
+) C ON A.year = C.year
+WHERE B.c IS NOT NULL
+ORDER BY year;
+
+
+# Count Coinbase transactions
+CREATE OR REPLACE TABLE `btc.stats_coinbase` AS
+SELECT      COUNT(tx_id) coinbase_edges, 
+            COUNT(DISTINCT tx_id) coinbase_txs 
+FROM       `btc.bitcoin_int` 
+WHERE       input_tx_id = 0;
+
+
+CREATE OR REPLACE TABLE `btc.stats_blk_files` AS
+SELECT      blk_file_nr,
+            MAX(ts) ts,
+            COUNT(ts) edges,
+            COUNT(DISTINCT tx_id) txs
+FROM       `btc.bitcoin_int`
+GROUP BY    blk_file_nr
+ORDER BY    blk_file_nr;
+
+
+# Stats on certain transaction outputs such as unknown skripts, OP_Returns etc.
+
+CREATE OR REPLACE TABLE `btc.stats_invalids` AS
+
+WITH sub AS (
+    SELECT DISTINCT id, address FROM `btc.ids_addresses`
+                                WHERE (address  = "undefined" 
+                                OR     address  = "invalid" 
+                                OR     address  = "opreturn"
+                                OR     address  = "unknown")
+                            )
+, subset AS(
+    SELECT      tx_id,
+                output_to_id
+    FROM       `btc.bitcoin_int` 
+    WHERE       output_to_id IN (SELECT id FROM sub)
+                            
+)
+SELECT  B.address,
+        edges,
+        txs
+FROM (  SELECT  output_to_id, 
+                COUNT(tx_id)           edges, 
+                COUNT(DISTINCT tx_id)  txs 
+    FROM        subset
+    GROUP BY    output_to_id) A
+LEFT JOIN (
+    SELECT id, address FROM sub
+) B ON B.id = A.output_to_id;
+
+
+# Last transactions
+CREATE OR REPLACE TABLE `btc.stats_last_tx` AS
+SELECT A.ts, B.tx_id, A.blk_file_nr
+FROM (
+    SELECT      ts,
+                tx_id, 
+                blk_file_nr
+    FROM       `btc.bitcoin_int` 
+    WHERE       DATE(ts) > "2022-01-01"
+    ORDER BY    ts DESC
+    LIMIT       1) A
+
+LEFT JOIN (
+    SELECT id, tx_id FROM `btc.ids_transactions`
+) B ON B.id = A.tx_id;
+
+
+# Monthly - Public Keys
+CREATE OR REPLACE TABLE `btc.stats_metrics_summary_per_month_pubk` AS
+
+SELECT      EXTRACT(YEAR FROM ts)        year,
+            EXTRACT(MONTH FROM ts)       month,
+            COUNT(DISTINCT tx_id)       txs,
+            COUNT(tx_id)                edges,
+            COUNT(DISTINCT input_from_id)   active_users
+FROM       `btc.bitcoin_mapped_int`
+
+GROUP BY    year,
+            month
+           
+ORDER BY    year,
+            month;
+
+# Monthly - Users without CJ
+CREATE OR REPLACE TABLE `btc.stats_metrics_summary_per_month_user_WCJ` AS
+
+SELECT      EXTRACT(YEAR FROM ts)           year,
+            EXTRACT(MONTH FROM ts)          month,
+            COUNT(DISTINCT tx_id)           txs,
+            COUNT(tx_id)                    edges,
+            COUNT(DISTINCT input_from_id)   active_users
+FROM       `btc.usergraph_mapped_int_WCJ`
+
+GROUP BY    year,
+            month
+           
+ORDER BY    year,
+            month;
+
+# Yearly - NOT USED
+CREATE OR REPLACE TABLE `btc.stats_transactions_per_year_int_WCJ` AS
+
+WITH        table_with_y 
+AS         (SELECT DISTINCT       tx_id, 
+            EXTRACT(YEAR FROM ts) year
+            FROM                 `btc.bitcoin_mapped_int_int_WCJ`) 
+
+SELECT      year, 
+            COUNT(DISTINCT tx_id) c 
+FROM table_with_y
+
+GROUP BY    year
+           
+ORDER BY    year;
+
+
+#
+# (Cumulated) Node/Edge/Tx Count
+# 
+# Coinbase transactions are excluded
+
+DECLARE n int64 DEFAULT 2009;
+DECLARE m int64 DEFAULT 2021;
+
+# Cumulated stats
+CREATE OR REPLACE TABLE     `btc.stats_user_count_cum_UG` AS
+
+(SELECT   n as year,  NULL txs_c,   NULL edges_c,   NULL addrs_c  
+          UNION ALL   SELECT n+1,   NULL, NULL,     NULL   
+          UNION ALL   SELECT n+2,   NULL, NULL,     NULL   
+          UNION ALL   SELECT n+3,   NULL, NULL,     NULL   
+          UNION ALL   SELECT n+4,   NULL, NULL,     NULL    
+          UNION ALL   SELECT n+5,   NULL, NULL,     NULL   
+          UNION ALL   SELECT n+6,   NULL, NULL,     NULL   
+          UNION ALL   SELECT n+7,   NULL, NULL,     NULL   
+          UNION ALL   SELECT n+8,   NULL, NULL,     NULL   
+          UNION ALL   SELECT n+9,   NULL, NULL,     NULL   
+          UNION ALL   SELECT n+10,  NULL, NULL,     NULL   
+          UNION ALL   SELECT n+11,  NULL, NULL,     NULL   
+          UNION ALL   SELECT n+12,  NULL, NULL,     NULL
+ORDER BY year);
+
+# From n to m
+WHILE n <= m DO
+
+    UPDATE   `btc.stats_user_count_cum_UG`  f
+
+    SET       txs_c   = unique_tx,
+              edges_c = edges,
+              addrs_c = unique_addrs  FROM (SELECT COUNT(DISTINCT tx_id)        unique_tx, 
+                                                   CAST(COUNT(tx_id)/2 AS INT)  edges, 
+                                                   COUNT(DISTINCT output_to_id) unique_addrs 
+
+                                            FROM  ( SELECT tx_id, output_to_id                  
+                                                    FROM `btc.usergraph_mapped_int` 
+                                                    WHERE EXTRACT(YEAR FROM ts) <= n
+
+                                                    UNION ALL 
+
+                                                    SELECT tx_id, input_from_id AS output_to_id 
+                                                    FROM `btc.usergraph_mapped_int` 
+                                                    WHERE EXTRACT(YEAR FROM ts) <= n
+                                                  ))
+   
+    WHERE     f.year = n;
+
+    SET       n = n + 1;
+
+END WHILE;
+
+# Global stats over the total data set
+CREATE OR REPLACE TABLE `btc.stats_user_count_UG` AS
+WITH df AS (
+    SELECT tx_id, output_to_id FROM `btc.usergraph_mapped_int`
+    )
+SELECT  COUNT(DISTINCT tx_id)    unique_tx, 
+        COUNT(tx_id)             edges, 
+        COUNT(DISTINCT output_to_id) unique_addrs 
+FROM    df;
+
+
+#
+# (Cumulated) Node/Edge/Tx Count
+# 
+# Coinbase transactions are excluded
+
+DECLARE n int64 DEFAULT 2009;
+DECLARE m int64 DEFAULT 2021;
+
+# Cumulated stats
+CREATE OR REPLACE TABLE     `btc.stats_user_count_cum_WCJ` AS
+
+(SELECT   n as year,  NULL txs_c,   NULL edges_c,   NULL addrs_c  
+          UNION ALL   SELECT n+1,   NULL, NULL,     NULL   
+          UNION ALL   SELECT n+2,   NULL, NULL,     NULL   
+          UNION ALL   SELECT n+3,   NULL, NULL,     NULL   
+          UNION ALL   SELECT n+4,   NULL, NULL,     NULL    
+          UNION ALL   SELECT n+5,   NULL, NULL,     NULL   
+          UNION ALL   SELECT n+6,   NULL, NULL,     NULL   
+          UNION ALL   SELECT n+7,   NULL, NULL,     NULL   
+          UNION ALL   SELECT n+8,   NULL, NULL,     NULL   
+          UNION ALL   SELECT n+9,   NULL, NULL,     NULL   
+          UNION ALL   SELECT n+10,  NULL, NULL,     NULL   
+          UNION ALL   SELECT n+11,  NULL, NULL,     NULL   
+          UNION ALL   SELECT n+12,  NULL, NULL,     NULL
+ORDER BY year);
+
+# From n to m
+WHILE n <= m DO
+
+    UPDATE   `btc.stats_user_count_cum_WCJ`  f
+
+    SET       txs_c   = unique_tx,
+              edges_c = edges,
+              addrs_c = unique_addrs  FROM (SELECT COUNT(DISTINCT tx_id)        unique_tx, 
+                                                   CAST(COUNT(tx_id)/2 AS INT)  edges, 
+                                                   COUNT(DISTINCT output_to_id)     unique_addrs 
+
+                                            FROM  ( SELECT tx_id, output_to_id                  
+                                                    FROM `btc.usergraph_mapped_int_WCJ` 
+                                                    WHERE EXTRACT(YEAR FROM ts) <= n
+
+                                                    UNION ALL 
+
+                                                    SELECT tx_id, input_from_id AS output_to_id 
+                                                    FROM `btc.usergraph_mapped_int_WCJ` 
+                                                    WHERE EXTRACT(YEAR FROM ts) <= n
+                                                  ))
+   
+    WHERE     f.year = n;
+
+    SET       n = n + 1;
+
+END WHILE;
+
+# Global stats over the total data set
+CREATE OR REPLACE TABLE `btc.stats_user_count_WCJ` AS
+WITH df AS (
+    SELECT tx_id, output_to_id FROM `btc.usergraph_mapped_int_WCJ`
+    )
+SELECT  COUNT(DISTINCT tx_id)    unique_tx, 
+        COUNT(tx_id)             edges, 
+        COUNT(DISTINCT output_to_id) unique_addrs 
+FROM    df;
+
+#
+# DEGREE DISTRIBUTIONS
+#
+CREATE OR REPLACE TABLE `btc.stats_degree_users` AS
+
+SELECT      ADDR.clusterid, 
+            IFNULL(A.in_degrees, 0)   AS in_degrees, 
+            IFNULL(B.out_degrees, 0)  AS out_degrees,
+            IFNULL(A.in_degrees, 0) + IFNULL(B.out_degrees, 0) AS total_degree
+            
+FROM       (SELECT DISTINCT  clusterid
+            FROM            `btc.ids_usergraph_WCJ`) ADDR
+
+            INNER JOIN
+
+           (SELECT    output_to_id, 
+                      COUNT(input_from_id) in_degrees 
+            FROM     `btc.usergraph_mapped_int_WCJ`
+            GROUP BY  output_to_id) A 
+            ON        ADDR.clusterid = A.output_to_id
+  
+            INNER JOIN 
+
+           (SELECT    input_from_id, 
+                      COUNT(output_to_id) out_degrees 
+            FROM     `btc.usergraph_mapped_int_WCJ` 
+            GROUP BY  input_from_id) B 
+            ON        ADDR.clusterid = B.input_from_id
+
+WHERE      (A.in_degrees > 0 OR B.out_degrees  > 0);
+
+
+# TOTAL
+CREATE OR REPLACE TABLE `btc.stats_degree_distribution_total` AS
+SELECT      total_degree AS degree, 
+            COUNT(total_degree) frequency 
+FROM       `btc.stats_degree_users` 
+GROUP BY    total_degree
+ORDER BY    total_degree ASC;
+
+# IN DEGREE
+CREATE OR REPLACE TABLE `btc.stats_degree_distribution_in_degree` AS
+SELECT      in_degrees AS degree, 
+            COUNT(in_degrees) frequency 
+FROM       `btc.stats_degree_users` 
+GROUP BY    in_degrees
+ORDER BY    in_degrees ASC;
+
+# OUT DEGREE
+CREATE OR REPLACE TABLE `btc.stats_degree_distribution_out_degree` AS
+SELECT      out_degrees AS degree,
+            COUNT(out_degrees) frequency 
+FROM       `btc.stats_degree_users` 
+GROUP BY    out_degrees
+ORDER BY    out_degrees ASC;
+
+
+#
+# Cumulated Average Outdegree per year
+# 
+# Coinbase transactions are excluded
+
+DECLARE n int64 DEFAULT 2009;
+DECLARE m int64 DEFAULT 2021;
+
+CREATE OR REPLACE TABLE     `btc.stats_avg_outdegree` AS
+
+(SELECT          n AS year,   99.9 avg_outdegree 
+    UNION ALL   SELECT n+1,   NULL,   
+    UNION ALL   SELECT n+2,   NULL,   
+    UNION ALL   SELECT n+3,   NULL,   
+    UNION ALL   SELECT n+4,   NULL,    
+    UNION ALL   SELECT n+5,   NULL,   
+    UNION ALL   SELECT n+6,   NULL,   
+    UNION ALL   SELECT n+7,   NULL,   
+    UNION ALL   SELECT n+8,   NULL,   
+    UNION ALL   SELECT n+9,   NULL,   
+    UNION ALL   SELECT n+10,  NULL,   
+    UNION ALL   SELECT n+11,  NULL,   
+    UNION ALL   SELECT n+12,  NULL,    
+ORDER BY year);
+
+
+
+WHILE n <= m DO
+
+    UPDATE     `btc.stats_avg_outdegree`  f
+
+    SET         avg_outdegree = _avg_outdegree
+    FROM       (SELECT  ROUND(AVG(c), 2) _avg_outdegree 
+
+                FROM   (SELECT      input_from_id, 
+                                    COUNT(output_to_id) c
+                    FROM           `btc.usergraph_mapped_int_WCJ` 
+                    WHERE           EXTRACT(YEAR FROM ts) <= n
+                    GROUP BY        input_from_id))   
+
+    WHERE   f.year = n;
+    SET     n      = n + 1;
+END WHILE;
+
+CREATE OR REPLACE TABLE `btc.stats_coinj_vs_total_edges_blk` AS
+SELECT  A.blk_file_nr, 
+        A.edges AS total_edges,
+        B.cj_edges AS coinj_edges,
+        A.edges-B.cj_edges AS difference,
+        B.cj_edges/A.edges*100 AS share
+FROM
+    (SELECT blk_file_nr, edges FROM `btc.stats_blk_files`) A
+    LEFT JOIN 
+    (SELECT blk_file_nr, cj_edges FROM `btc.coinj_per_blk`) B ON A.blk_file_nr = B.blk_file_nr
+ORDER BY A.blk_file_nr
+
+
+# Edges and transaction vs price
+
+CREATE OR REPLACE TABLE `btc.price_txs_edges_per_month` AS
+SELECT A.year, A.month, A.close, B.txs, B.edges, B.active_users FROM(
+   SELECT X.year, X.month, Y.close FROM
+        (SELECT  EXTRACT(YEAR FROM date)  year, 
+                 EXTRACT(MONTH FROM date) month,
+                 MAX(EXTRACT(DAY FROM date)) max_day
+        FROM `btc.bitcoin_price`
+        GROUP BY year, month) X
+        INNER JOIN 
+        (SELECT EXTRACT(YEAR FROM date)  year, 
+                EXTRACT(MONTH FROM date) month,
+                EXTRACT(DAY FROM date) day,
+                close 
+        FROM `btc.bitcoin_price`) Y 
+        ON  X.year    = Y.year 
+        AND X.month   = Y.month 
+        AND X.max_day = Y.day) A
+INNER JOIN (
+    SELECT  year,
+            month,
+            txs, 
+            edges,
+            active_users 
+    FROM `btc.stats_metrics_summary_per_month_user_WCJ`
+) B ON  A.year  = B.year AND 
+        A.month = B.month
+        
+ORDER BY year, 
+         month;
+         
+         
+CREATE OR REPLACE TABLE `btc.services_all_new` AS
+SELECT DISTINCT service FROM `btc.services_new`;
+
+
+CREATE OR REPLACE TABLE `btc.stats_largest_cluster` AS 
+SELECT A.address, A.clusterid, B.service FROM(
+    SELECT address, clusterid FROM `btc.ids_usergraph_UG`
+    WHERE clusterid = 9) A
+    LEFT JOIN (
+        SELECT address, service FROM `btc.ids_services` 
+    ) B
+    ON B.address = A.address;
+
+
+CREATE OR REPLACE TABLE `btc.stats_largest_cluster_services` AS 
+SELECT service , COUNT(service) c FROM `btc.stats_largest_cluster`
+GROUP BY service
+ORDER BY c DESC;
+
+
+CREATE OR REPLACE TABLE `btc.stats_2nd_largest_cluster_services` AS 
+With services AS (
+SELECT A.address, A.clusterid, B.service FROM(
+    SELECT address, clusterid FROM `btc.ids_usergraph_without_cj`
+    WHERE clusterid = 572) A
+    LEFT JOIN (
+        SELECT address, service FROM `btc.ids_services` 
+    ) B
+    ON B.address = A.address)
+
+SELECT service , COUNT(service) c FROM services
+GROUP BY service
+ORDER BY c DESC;
+
+
+# (Cumulated) Node/Edge/Tx Count
+# 
+# Coinbase transactions are excluded
+
+DECLARE n int64 DEFAULT 2009;
+DECLARE m int64 DEFAULT 2021;
+
+# Cumulated stats
+CREATE OR REPLACE TABLE     `btc.stats_general_metrics` AS
+
+(SELECT   n as year,  NULL txs_c,   NULL edges_c,   NULL addrs_c  
+          UNION ALL   SELECT n+1,   NULL, NULL,     NULL   
+          UNION ALL   SELECT n+2,   NULL, NULL,     NULL   
+          UNION ALL   SELECT n+3,   NULL, NULL,     NULL   
+          UNION ALL   SELECT n+4,   NULL, NULL,     NULL    
+          UNION ALL   SELECT n+5,   NULL, NULL,     NULL   
+          UNION ALL   SELECT n+6,   NULL, NULL,     NULL   
+          UNION ALL   SELECT n+7,   NULL, NULL,     NULL   
+          UNION ALL   SELECT n+8,   NULL, NULL,     NULL   
+          UNION ALL   SELECT n+9,   NULL, NULL,     NULL   
+          UNION ALL   SELECT n+10,  NULL, NULL,     NULL   
+          UNION ALL   SELECT n+11,  NULL, NULL,     NULL   
+          UNION ALL   SELECT n+12,  NULL, NULL,     NULL
+ORDER BY year);
+
+# From n to m
+WHILE n <= m DO
+
+    UPDATE   `btc.stats_general_metrics`  f
+
+    SET       txs_c   = unique_tx,
+              edges_c = edges,
+              addrs_c = unique_addrs  FROM (SELECT COUNT(DISTINCT tx_id)        unique_tx, 
+                                                   COUNT(tx_id)  edges, 
+                                                   COUNT(DISTINCT output_to_id) unique_addrs 
+
+                                            FROM  ( SELECT tx_id, output_to_id                  
+                                                    FROM `btc.bitcoin_int` 
+                                                    WHERE EXTRACT(YEAR FROM ts) <= n
+                                                  ))
+   
+    WHERE     f.year = n;
+
+    SET       n = n + 1;
+
+END WHILE;
+
+
+CREATE OR REPLACE TABLE `btc.usergraph_clustersizes_services` AS
+SELECT      clusterid, 
+            service,
+            COUNT(DISTINCT address) clustersize 
+FROM       `btc.ids_services` 
+GROUP BY    clusterid, service   
+ORDER BY    clustersize DESC;
+
+
+CREATE OR REPLACE TABLE `btc.usergraph_clustersizes_services` AS
+SELECT      clusterid, 
+            service,
+            COUNT(DISTINCT address) clustersize 
+FROM       `btc.ids_services` 
+GROUP BY    clusterid, service   
+ORDER BY    clustersize DESC;
+
+
+SELECT COUNT(DISTINCT tx_id) FROM `wu-btc-network.btc.usergraph_links` 
+
+
+# NEO4J Preparer
+
+CREATE OR REPLACE TABLE `btc.temp_links_WCJ` AS
+SELECT DISTINCT     tx_id,
+                    input_from_id,
+FROM               `btc.bitcoin_mapped_int_WCJ`
+WHERE               tx_id IN (SELECT DISTINCT tx_id FROM `btc.usergraph_links_WCJ`)
+ORDER BY            tx_id;
+
+CREATE OR REPLACE TABLE `btc.neo4j_ids` AS
+SELECT  id, 
+        clusterid 
+FROM   `btc.ids_users` 
+WHERE   id IN (SELECT DISTINCT  input_from_id 
+               FROM            `btc.temp_links_WCJ`);
+
+
+CREATE OR REPLACE TABLE `btc.neo4j_txs` AS
+SELECT DISTINCT tx_id FROM `btc.temp_links_WCJ` order by tx_id;
+
+
+CREATE OR REPLACE TABLE `btc.neo4j_rel` AS
+SELECT * FROM `wu-btcgraph.btc.temp_links_WCJ` order by tx_id;
+
+
+CREATE OR REPLACE TABLE `btc.z_degrees` AS
+SELECT A.*, IFNULL(B.out_degree, 0) AS out_degree, IFNULL(C.in_degree, 0) AS in_degree, IFNULL(B.out_degree, 0) +  IFNULL(C.in_degree, 0) AS total_degree  FROM
+(SELECT address, id FROM `wu-btcgraph.btc.ids_addresses`) A
+LEFT JOIN 
+(SELECT
+    output_to_id, 
+    count(output_to_id) out_degree 
+    FROM `btc.bitcoin_usergraph`
+    group by output_to_id) B ON B.output_to_id = A.id
+LEFT JOIN (
+    SELECT
+    input_from_id,
+    count(input_from_id) in_degree 
+    FROM `btc.bitcoin_usergraph`
+    GROUP BY input_from_id
+)  C on C.input_from_id = A.id
+ORDER BY total_degree DESC;
